@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package queue;
+
+service Queue{
+    rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
+    rpc Dequeue(DequeueRequest) returns (DequeueResponse);
+    rpc Ack(AckRequest) returns (AckResponse);
+}
+
+message EnqueueRequest {
+    string payload = 1;
+}
+
+message EnqueueResponse {
+  string job_id = 1;
+}
+
+message DequeueRequest {}
+
+message DequeueResponse {
+    string job_id = 1;
+    string payload = 2;
+
+}
+
+message AckRequest {
+  string job_id = 1;
+}
+message AckResponse {}

@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "broker",
+    "producer",
+    "consumer",
+    "common",
+]
+resolver = "2"
