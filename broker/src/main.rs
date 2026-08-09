@@ -2,6 +2,7 @@ pub mod proto {
     tonic::include_proto!("queue");
 }
 pub mod broker;
+pub mod job;
 
 use std::{error::Error, net::SocketAddr};
 use tonic::transport::Server;

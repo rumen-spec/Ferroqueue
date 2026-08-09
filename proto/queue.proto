@@ -1,6 +1,7 @@
 syntax = "proto3";
 
 package queue;
+import "google/protobuf/timestamp.proto";
 
 service Queue{
     rpc Enqueue(EnqueueRequest) returns (EnqueueResponse);
@@ -19,8 +20,9 @@ message EnqueueResponse {
 message DequeueRequest {}
 
 message DequeueResponse {
-    string job_id = 1;
-    string payload = 2;
+    optional string job_id = 1;
+    optional string payload = 2;
+    optional google.protobuf.Timestamp created_at = 3;
 
 }
 
