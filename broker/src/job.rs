@@ -23,6 +23,12 @@ pub struct Job {
     created_at: DateTime<Utc>
 }
 
+#[derive(Debug, Clone, Copy, Hash)]
+pub struct VisibilityEntry{
+    pub id: Uuid,
+    pub visible_at: DateTime<Utc>
+}
+
 #[derive(Debug, Hash, Clone)]
 pub enum JobState{
     READY,
