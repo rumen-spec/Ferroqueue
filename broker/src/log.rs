@@ -10,7 +10,7 @@ use chrono::DateTime;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::broker::QueueService;
+use crate::broker::{QueueService, VISIBILITY_S, backoff_seconds};
 use crate::job::{Job, JobState, New};
 const HEADER_LEN: usize = 8;
 const MAX_BATCH: usize = 1024;
@@ -21,6 +21,8 @@ pub enum Record {
     Acked { job_id: u128 },
     Retried { job_id: u128, retries: i32 },
     DeadLettered { job_id: u128 },
+    /// An operator returned a dead-lettered job to the ready queue.
+    Redriven { job_id: u128 },
 }
 
 enum Cmd {
@@ -198,6 +200,9 @@ pub async fn replay(service: &QueueService, records: Vec<Record>) {
                 let id = Uuid::from_u128(job_id);
                 if let Some(job) = service.jobs.lock().await.get_mut(&id) {
                     job.set_retries(retries);
+                    // Backoff is a pure function of the retry count, so it does
+                    // not need its own field in the log.
+                    job.set_retry_time_s(backoff_seconds(retries));
                 }
             }
             Record::Acked { job_id } => {
@@ -212,6 +217,16 @@ pub async fn replay(service: &QueueService, records: Vec<Record>) {
                     job.set_state(JobState::DLQ);
                 }
                 service.dl_queue.lock().await.push_back(id);
+            }
+            Record::Redriven { job_id } => {
+                let id = Uuid::from_u128(job_id);
+                service.dl_queue.lock().await.retain(|queued| *queued != id);
+                if let Some(job) = service.jobs.lock().await.get_mut(&id) {
+                    job.set_retries(0);
+                    job.set_retry_time_s(VISIBILITY_S);
+                    job.set_state(JobState::READY);
+                }
+                service.ready_queue.lock().await.push_back(id);
             }
         }
     }

@@ -171,10 +171,10 @@ crates/
 ## Roadmap
 
 ### Phase 1
-- [ ] Single-node queue
-- [ ] WAL
-- [ ] ACK handling
-- [ ] Visibility timeout
+- [x] Single-node queue
+- [x] WAL
+- [x] ACK handling
+- [x] Visibility timeout
 
 ### Phase 2
 - [ ] Retry scheduler

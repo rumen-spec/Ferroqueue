@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Write-ahead log written into the working directory at runtime
+*.wal
