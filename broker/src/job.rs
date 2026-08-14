@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Getters, CopyGetters, Setters, Clone)]
 pub struct Job {
-    #[getset(get_copy = "pub")]
+    #[getset(get_copy = "pub", set = "pub")]
     id: Uuid,
     #[getset(get = "pub")]
     payload: String,
@@ -16,17 +16,9 @@ pub struct Job {
     #[getset(get_copy = "pub", set = "pub")]
     retries: i32,
     #[getset(get_copy = "pub", set = "pub")]
-    retry_time_s: i32,
+    retry_time_s: i64,
     #[getset(get_copy = "pub", set = "pub")]
-    visible_at: Option<DateTime<Utc>>,
-    #[getset(get_copy = "pub")]
     created_at: DateTime<Utc>
-}
-
-#[derive(Debug, Clone, Copy, Hash)]
-pub struct VisibilityEntry{
-    pub id: Uuid,
-    pub visible_at: DateTime<Utc>
 }
 
 #[derive(Debug, Hash, Clone)]
@@ -48,8 +40,7 @@ impl New for Job {
             payload: payload,
             state: JobState::READY,
             retries: 0,
-            retry_time_s: 0,
-            visible_at: None,
+            retry_time_s: 1,
             created_at: Utc::now()
         }
     }

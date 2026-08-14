@@ -21,12 +21,13 @@ message DequeueRequest {}
 
 message DequeueResponse {
     optional string job_id = 1;
-    optional string payload = 2;
-    optional google.protobuf.Timestamp created_at = 3;
+    optional string delivery_id = 2;
+    optional string payload = 3;
+    optional google.protobuf.Timestamp created_at = 4;
 
 }
 
 message AckRequest {
-  string job_id = 1;
+  string delivery_id = 1;
 }
 message AckResponse {}
