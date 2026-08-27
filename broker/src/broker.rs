@@ -14,12 +14,8 @@ use crate::proto::queue::{
 use crate::raft::{Node, ProposeError};
 use crate::state::{MAX_QUEUE_DEPTH, MAX_RETRIES, Record, backoff_seconds};
 
-/// The client-facing API. Translates protobuf to records, hands them to
-/// consensus, and reads committed state back out. It holds no state of its own.
 pub struct QueueService {
     node: Arc<Node>,
-    /// Serialises the read-then-propose in `dequeue`, so two consumers cannot
-    /// both see the same job at the head of the ready queue.
     dequeue: Mutex<()>,
 }
 
@@ -50,8 +46,6 @@ impl Queue for QueueService {
         &self,
         req: Request<EnqueueRequest>,
     ) -> Result<Response<EnqueueResponse>, Status> {
-        // Backpressure before consensus: no reason to spend a replication round
-        // trip on a request that is going to be rejected.
         let depth = self.node.state().depth().await;
         if depth >= MAX_QUEUE_DEPTH {
             return Err(Status::resource_exhausted(format!(
@@ -59,8 +53,6 @@ impl Queue for QueueService {
             )));
         }
 
-        // The leader mints the id and timestamp so that every replica applies
-        // the same values rather than generating its own.
         let job_id = Uuid::new_v4();
         self.node
             .propose(Record::Enqueued {
@@ -118,8 +110,6 @@ impl Queue for QueueService {
             .parse()
             .map_err(|_| Status::invalid_argument("Invalid delivery ID"))?;
 
-        // Look the lease up without removing it; `apply` performs the removal
-        // once the record commits.
         let Some(job_id) = self.node.state().job_of_delivery(delivery_id).await else {
             return Err(Status::not_found("No such delivery; it may have expired"));
         };
@@ -190,11 +180,6 @@ impl Queue for QueueService {
     }
 }
 
-/// Moves expired leases back to ready, or to the DLQ once they have burned
-/// through `MAX_RETRIES`.
-///
-/// Leader-only: every node running its own clock against its own state would
-/// have each of them independently bumping the retry count.
 pub async fn sweep_expired_leases(node: Arc<Node>, interval: StdDuration) {
     let mut ticker = tokio::time::interval(interval);
     loop {
@@ -204,13 +189,10 @@ pub async fn sweep_expired_leases(node: Arc<Node>, interval: StdDuration) {
             continue;
         }
 
-        // Drain everything already expired, then wait for the next tick.
         loop {
             let now = Utc::now();
             let Some((job_id, delivery_id)) = node.state().peek_expired(now).await else { break };
 
-            // The leader decides which transition this is; the record says
-            // which, so `apply` never re-derives it from MAX_RETRIES.
             let retries = node.state().retries_of(job_id).await.unwrap_or(0);
             let record = if retries + 1 >= MAX_RETRIES {
                 Record::DeadLettered {

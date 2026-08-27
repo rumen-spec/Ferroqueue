@@ -10,19 +10,10 @@ use crate::job::{Job, JobState, New};
 pub const VISIBILITY_S: i64 = 5;
 pub const MAX_RETRIES: i32 = 10;
 
-/// Ceiling on the retry backoff, so a job that keeps failing does not drift
-/// out to an unusable redelivery interval before it reaches the DLQ.
 const MAX_BACKOFF_S: i64 = 300;
 
-/// Unacknowledged jobs the broker will hold before rejecting producers. Counts
-/// dead-lettered jobs too, since those also occupy memory until redriven.
 pub const MAX_QUEUE_DEPTH: usize = 10_000;
 
-/// A state transition.
-///
-/// Every field is something `apply` could not have worked out for itself: a
-/// value from the clock, from a random generator, or from the client. Anything
-/// derivable from existing state is deliberately absent and recomputed.
 #[derive(Encode, Decode, Debug, Clone, PartialEq)]
 pub enum Record {
     Enqueued { job_id: u128, payload: String, created_at: i64 },
@@ -30,15 +21,9 @@ pub enum Record {
     Acked { job_id: u128, delivery_id: u128 },
     Retried { job_id: u128, delivery_id: u128 },
     DeadLettered { job_id: u128, delivery_id: u128 },
-    /// An operator returned a dead-lettered job to the ready queue.
     Redriven { job_id: u128 },
 }
 
-/// Visibility timeout for a job's next delivery, doubling per retry.
-///
-/// With no nack RPC, lease expiry is the only failure signal, so the lease
-/// length *is* the interval between redelivery attempts: a consumer that keeps
-/// dying sees gaps of 5s, 10s, 20s, 40s... rather than a hot loop.
 pub fn backoff_seconds(retries: i32) -> i64 {
     let doublings = retries.clamp(0, 16) as u32;
     VISIBILITY_S
@@ -46,13 +31,9 @@ pub fn backoff_seconds(retries: i32) -> i64 {
         .min(MAX_BACKOFF_S)
 }
 
-/// Outstanding deliveries, indexed two ways so neither the expiry sweep nor ack
-/// has to scan. Both maps always describe the same set of deliveries.
 #[derive(Debug, Default)]
 pub struct InvisibleQueue {
-    /// (visible_at, delivery_id) -> job_id, ordered by expiry.
     timers: BTreeMap<(DateTime<Utc>, Uuid), Uuid>,
-    /// delivery_id -> (job_id, visible_at), so ack can rebuild the timer key.
     leases: HashMap<Uuid, (Uuid, DateTime<Utc>)>,
 }
 
@@ -72,8 +53,6 @@ impl InvisibleQueue {
         self.leases.get(&delivery_id).map(|(job_id, _)| *job_id)
     }
 
-    /// The earliest lease if it has expired by `now`, left in place. The caller
-    /// records the expiry and `apply` performs the removal.
     fn peek_expired(&self, now: DateTime<Utc>) -> Option<(Uuid, Uuid)> {
         let (&(visible_at, delivery_id), &job_id) = self.timers.first_key_value()?;
         (visible_at <= now).then_some((job_id, delivery_id))
@@ -88,17 +67,11 @@ struct Inner {
     dead: VecDeque<Uuid>,
 }
 
-/// The replicated state machine: the queue and nothing else.
-///
-/// Knows nothing about gRPC and nothing about Raft. `apply` is the only way to
-/// change it, and is a pure function of (record, current state) so that every
-/// replica fed the same records lands in the same place.
 #[derive(Debug, Default)]
 pub struct QueueState {
     inner: Mutex<Inner>,
 }
 
-/// A dead-lettered job, flattened for the API layer.
 pub struct DeadJobView {
     pub job_id: Uuid,
     pub payload: String,
@@ -166,14 +139,10 @@ impl QueueState {
         }
     }
 
-    /// Unacknowledged jobs held, for the backpressure check.
     pub async fn depth(&self) -> usize {
         self.inner.lock().await.jobs.len()
     }
 
-    /// The next job a consumer would receive, with the retry count that decides
-    /// how long its lease should last. Left in the ready queue; `apply` removes
-    /// it when the lease record commits.
     pub async fn peek_ready(&self) -> Option<(Uuid, i32)> {
         let inner = self.inner.lock().await;
         let id = *inner.ready.front()?;

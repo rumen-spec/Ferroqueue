@@ -7,21 +7,14 @@ use bincode_next::{Decode, Encode};
 
 use crate::state::Record;
 
-/// Record framing: `u32` payload length, `u32` CRC32 of the payload.
 const HEADER_LEN: usize = 8;
 
-/// What a committed log entry instructs the cluster to do.
-///
-/// `Noop` exists because a freshly elected leader appends one to discover its
-/// own commit point without waiting for client traffic.
 #[derive(Encode, Decode, Debug, Clone, PartialEq)]
 pub enum EntryPayload {
     Noop,
     Queue(Record),
 }
 
-/// One slot in the replicated log. `term` and `index` belong to Raft; the
-/// payload belongs to the application.
 #[derive(Encode, Decode, Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub term: u64,
@@ -29,24 +22,14 @@ pub struct LogEntry {
     pub payload: EntryPayload,
 }
 
-/// The durable replicated log.
-///
-/// Entries are held in memory for the protocol to compare and stream, and
-/// mirrored to an append-only file. Index is 1-based; index 0 means "empty",
-/// which is what `prev_log_index` carries for the very first entry.
 pub struct RaftLog {
     file: File,
     entries: Vec<LogEntry>,
-    /// Byte offset where each entry's frame begins, so a truncation can shrink
-    /// the file without rewriting it.
     offsets: Vec<u64>,
     bytes: u64,
 }
 
 impl RaftLog {
-    /// Opens the log at `path`, creating it if absent, and loads what is there.
-    /// A torn trailing record — the ordinary result of crashing mid-append — is
-    /// discarded and truncated away.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path: PathBuf = path.as_ref().to_path_buf();
 
@@ -80,8 +63,6 @@ impl RaftLog {
         self.entries.last().map(|e| e.term).unwrap_or(0)
     }
 
-    /// Term of the entry at `index`, or 0 for index 0 (the empty-log sentinel).
-    /// `None` means the index is past the end and there is nothing to compare.
     pub fn term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return Some(0);
@@ -96,8 +77,6 @@ impl RaftLog {
         self.entries.get((index - 1) as usize)
     }
 
-    /// Entries from `index` onward, capped at `limit`, for streaming to a
-    /// follower that is behind.
     pub fn entries_from(&self, index: u64, limit: usize) -> Vec<LogEntry> {
         if index == 0 || index > self.last_index() {
             return Vec::new();
@@ -122,8 +101,6 @@ impl RaftLog {
             at += (buf.len() - before) as u64;
         }
 
-        // One write and one fsync for the whole slice, so an AppendEntries
-        // carrying many entries costs a single flush.
         self.file.write_all(&buf)?;
         self.file.sync_data()?;
 
@@ -133,8 +110,6 @@ impl RaftLog {
         Ok(())
     }
 
-    /// Discards everything after `index`. Used when a follower's log diverges
-    /// from the leader's and the conflicting suffix has to go.
     pub fn truncate_after(&mut self, index: u64) -> io::Result<()> {
         if index >= self.last_index() {
             return Ok(());
@@ -168,8 +143,6 @@ pub fn decode_entry(bytes: &[u8]) -> Result<LogEntry, bincode_next::error::Decod
     bincode_next::decode_from_slice::<LogEntry, _>(bytes, config::standard()).map(|(entry, _)| entry)
 }
 
-/// Decodes entries until one fails to parse, returning them with their byte
-/// offsets and the offset of the first bad byte.
 fn parse(data: &[u8]) -> (Vec<LogEntry>, Vec<u64>, usize) {
     let mut entries = Vec::new();
     let mut offsets = Vec::new();
@@ -259,7 +232,6 @@ mod tests {
         assert_eq!(log.last_index(), 2);
         assert!(std::fs::metadata(&path).unwrap().len() < full_len);
 
-        // Appending after a truncation must land at index 3 again.
         log.append(&[entry(5, 3)]).unwrap();
         assert_eq!(log.term_at(3), Some(5));
 

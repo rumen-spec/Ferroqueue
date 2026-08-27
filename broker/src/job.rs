@@ -4,7 +4,6 @@ use chrono::{self, DateTime, Utc};
 use getset::{CopyGetters, Getters, Setters};
 use uuid::Uuid;
 
-
 #[derive(Debug, Getters, CopyGetters, Setters, Clone)]
 pub struct Job {
     #[getset(get_copy = "pub", set = "pub")]

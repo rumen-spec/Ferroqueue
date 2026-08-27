@@ -38,7 +38,6 @@ struct Config {
     dir: String,
     client_addr: String,
     peer_addr: String,
-    /// Every member's raft address, including this node's.
     members: Vec<String>,
 }
 
@@ -85,11 +84,6 @@ impl Config {
     }
 }
 
-/// Node and cluster ids are derived from addresses rather than generated, so
-/// every member computes the same values from the same config and there is no
-/// chicken-and-egg at bootstrap. A consequence: changing a node's peer address
-/// changes its identity, and pointing it at a different member set changes the
-/// cluster id, which the data directory will then refuse to load.
 fn derive_id(value: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, value.as_bytes())
 }
@@ -131,8 +125,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tokio::spawn(Arc::clone(&node).run());
     tokio::spawn(broker::sweep_expired_leases(Arc::clone(&node), SWEEP_INTERVAL));
 
-    // Peer traffic gets its own listener so client load cannot starve
-    // heartbeats, and so it can be firewalled separately.
     let peer_socket: SocketAddr = config.peer_addr.parse()?;
     let raft_node = Arc::clone(&node);
     tokio::spawn(async move {

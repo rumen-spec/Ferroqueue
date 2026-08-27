@@ -16,13 +16,10 @@ use crate::proto::raft::{
 use crate::state::{QueueState, Record};
 use crate::transport::{NodeId, RaftTransport};
 
-/// How often the driver wakes to check timers.
 const TICK: Duration = Duration::from_millis(20);
-/// Leader heartbeat interval. Must be comfortably below the election timeout.
 const HEARTBEAT: Duration = Duration::from_millis(50);
 const ELECTION_TIMEOUT_MIN_MS: u64 = 150;
 const ELECTION_TIMEOUT_MAX_MS: u64 = 300;
-/// Entries per AppendEntries, so catching up a far-behind follower is bounded.
 const MAX_ENTRIES_PER_RPC: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,25 +31,17 @@ pub enum Role {
 
 #[derive(Debug)]
 pub enum ProposeError {
-    /// This node is not the leader. Carries the leader's id if known, so the
-    /// caller can redirect instead of guessing.
     NotLeader(Option<NodeId>),
-    /// Leadership changed before the entry committed, so the entry may or may
-    /// not survive. The client must retry and rely on idempotency.
     LostLeadership,
     Storage(String),
 }
 
-/// Term and vote — the two fields Raft requires to be durable before any RPC
-/// that depends on them is answered.
 #[derive(Encode, Decode, Debug, Clone, Default)]
 struct HardState {
     current_term: u64,
     voted_for: Option<u128>,
 }
 
-/// Written once at bootstrap. `cluster_id` is a safety interlock: a node
-/// refuses to load a data directory belonging to a different cluster.
 #[derive(Encode, Decode, Debug, Clone)]
 pub struct Identity {
     pub node_id: u128,
@@ -70,8 +59,6 @@ struct Core {
     next_index: HashMap<NodeId, u64>,
     match_index: HashMap<NodeId, u64>,
     votes: HashSet<NodeId>,
-    /// When each peer last answered us. A leader that cannot reach a majority
-    /// uses this to notice and stand down.
     last_response: HashMap<NodeId, Instant>,
     last_heard: Instant,
     last_heartbeat_sent: Instant,
@@ -82,16 +69,12 @@ pub struct Node {
     id: NodeId,
     cluster_id: Uuid,
     peers: Vec<NodeId>,
-    /// Votes (and matching replicas) needed to commit. A single node needs 1,
-    /// which is itself, so a one-member cluster commits after its own fsync.
     quorum: usize,
     core: Mutex<Core>,
     state: Arc<QueueState>,
     transport: Arc<dyn RaftTransport>,
     hard_state_path: PathBuf,
-    /// Callers blocked until their entry is applied, keyed by log index.
     waiters: Mutex<Vec<(u64, oneshot::Sender<Result<(), ProposeError>>)>>,
-    /// Peers with an AppendEntries outstanding, so responses cannot interleave.
     inflight: Mutex<HashSet<NodeId>>,
     replicate: Notify,
 }
@@ -101,12 +84,6 @@ fn random_election_timeout() -> Duration {
 }
 
 impl Node {
-    /// Opens the node at `dir`, bootstrapping a fresh identity if the directory
-    /// is empty and restoring the existing one otherwise.
-    ///
-    /// Never silently falls back to bootstrap: a directory with a log but no
-    /// identity is damaged, and regenerating an id there would produce a node
-    /// the cluster does not recognise.
     pub async fn open(
         dir: impl AsRef<Path>,
         node_id: NodeId,
@@ -225,8 +202,6 @@ impl Node {
         self.core.lock().await.commit_index
     }
 
-    /// Replicates `record` and returns once it has been applied here, meaning a
-    /// majority holds it durably.
     pub async fn propose(self: &Arc<Self>, record: Record) -> Result<(), ProposeError> {
         let index = {
             let mut core = self.core.lock().await;
@@ -243,8 +218,6 @@ impl Node {
         let (tx, rx) = oneshot::channel();
         self.waiters.lock().await.push((index, tx));
 
-        // A single-member cluster reaches quorum on its own fsync, so this call
-        // is what makes the one-node path commit without waiting for a tick.
         self.advance_commit().await;
         self.apply_committed().await;
         self.replicate.notify_one();
@@ -254,8 +227,6 @@ impl Node {
             Err(_) => Err(ProposeError::LostLeadership),
         }
     }
-
-    // ---------------------------------------------------------------- handlers
 
     pub async fn handle_request_vote(&self, req: RequestVoteRequest) -> RequestVoteResponse {
         let mut core = self.core.lock().await;
@@ -272,16 +243,12 @@ impl Node {
         };
 
         let free_to_vote = core.voted_for.is_none() || core.voted_for == Some(candidate);
-        // Refuse anyone whose log is behind ours, or they could win and then
-        // order us to discard entries that are already committed.
         let log_current = (req.last_log_term, req.last_log_index)
             >= (core.log.last_term(), core.log.last_index());
 
         let granted = free_to_vote && log_current;
         if granted {
             core.voted_for = Some(candidate);
-            // Durable before the vote leaves this node: a crash after replying
-            // but before persisting would let us vote twice in one term.
             if let Err(e) = self.persist_hard_state(&core) {
                 eprintln!("raft: refusing to vote, could not persist state: {e}");
                 return RequestVoteResponse { term: core.current_term, vote_granted: false };
@@ -306,12 +273,10 @@ impl Node {
             self.step_down(&mut core, req.term);
         }
 
-        // A heartbeat at our own term means someone else won; stop campaigning.
         core.role = Role::Follower;
         core.leader = req.leader_id.parse::<Uuid>().ok();
         core.last_heard = Instant::now();
 
-        // Log matching: one (index, term) pair certifies the whole prefix.
         if core.log.term_at(req.prev_log_index) != Some(req.prev_log_term) {
             return AppendEntriesResponse {
                 term: core.current_term,
@@ -335,8 +300,6 @@ impl Node {
             }
         }
 
-        // Skip entries we already have; on the first conflict, drop our
-        // divergent suffix and take the leader's from there.
         let mut fresh_from = entries.len();
         for (i, entry) in entries.iter().enumerate() {
             match core.log.term_at(entry.index) {
@@ -384,9 +347,6 @@ impl Node {
         }
     }
 
-    // ----------------------------------------------------------------- driver
-
-    /// Election timers and heartbeats. Runs for the life of the process.
     pub async fn run(self: Arc<Self>) {
         loop {
             tokio::select! {
@@ -407,9 +367,6 @@ impl Node {
             };
 
             if role != Role::Leader {
-                // Anything proposed while we were leader can no longer be
-                // driven to a quorum. Fail it rather than leaving the caller
-                // blocked forever.
                 self.fail_pending_proposals().await;
             }
 
@@ -434,7 +391,6 @@ impl Node {
             core.votes.clear();
             core.votes.insert(self.id);
             core.last_heard = Instant::now();
-            // Re-rolled every attempt: fixed timeouts split the vote forever.
             core.election_timeout = random_election_timeout();
 
             if let Err(e) = self.persist_hard_state(&core) {
@@ -444,7 +400,6 @@ impl Node {
             (core.current_term, core.log.last_index(), core.log.last_term())
         };
 
-        // A single-member cluster has already won by voting for itself.
         if self.peers.is_empty() {
             self.become_leader(term).await;
             return;
@@ -474,7 +429,6 @@ impl Node {
                 let _ = self.persist_hard_state(&core);
                 return;
             }
-            // Ignore votes for an election we have already moved past.
             if core.role != Role::Candidate || core.current_term != term {
                 return;
             }
@@ -508,9 +462,6 @@ impl Node {
                 core.last_response.insert(*peer, now);
             }
 
-            // A no-op from our own term: the leader may only advance the commit
-            // index using an entry it created itself, so without this it cannot
-            // commit anything inherited from a previous term.
             let entry = LogEntry { term, index: next, payload: EntryPayload::Noop };
             if let Err(e) = core.log.append(&[entry]) {
                 eprintln!("raft: could not append leader no-op: {e}");
@@ -526,7 +477,7 @@ impl Node {
         for peer in &self.peers {
             let peer = *peer;
             if !self.inflight.lock().await.insert(peer) {
-                continue; // one request per peer at a time
+                continue;
             }
 
             let (term, req) = {
@@ -579,7 +530,6 @@ impl Node {
     ) {
         {
             let mut core = self.core.lock().await;
-            // Any reply at all proves the peer is reachable.
             core.last_response.insert(peer, Instant::now());
 
             if resp.term > core.current_term {
@@ -595,7 +545,6 @@ impl Node {
                 core.match_index.insert(peer, resp.match_index);
                 core.next_index.insert(peer, resp.match_index + 1);
             } else {
-                // Walk backwards until the logs agree.
                 let next = core.next_index.get(&peer).copied().unwrap_or(1);
                 core.next_index.insert(peer, next.saturating_sub(1).max(1));
             }
@@ -605,8 +554,6 @@ impl Node {
         self.apply_committed().await;
     }
 
-    /// Commit index is the highest index a majority holds — the median of the
-    /// match indices, including our own log.
     async fn advance_commit(&self) {
         let mut core = self.core.lock().await;
         if core.role != Role::Leader {
@@ -622,9 +569,6 @@ impl Node {
         indices.sort_unstable_by(|a, b| b.cmp(a));
 
         let candidate = indices[self.quorum - 1];
-        // Only entries from the current term may be committed by counting
-        // replicas; an inherited entry is committed indirectly, once a
-        // current-term entry above it commits.
         if candidate > core.commit_index && core.log.term_at(candidate) == Some(core.current_term) {
             core.commit_index = candidate;
         }
@@ -660,10 +604,6 @@ impl Node {
         *waiters = still_waiting;
     }
 
-    /// Plain Raft lets a partitioned leader keep believing it leads, accepting
-    /// writes that can never commit while clients wait on them. So a leader
-    /// that has not heard from a majority within an election timeout stands
-    /// down: by then someone reachable may already be campaigning.
     async fn step_down_if_quorum_lost(&self) {
         if self.peers.is_empty() {
             return;
@@ -726,8 +666,6 @@ fn read_bincode<T: Decode<()>>(path: &Path) -> io::Result<Option<T>> {
     }
 }
 
-/// Write-then-rename, so a crash mid-write cannot leave a half-written file
-/// where the term or vote used to be.
 fn write_bincode<T: Encode>(path: &Path, value: &T) -> io::Result<()> {
     let bytes = bincode_next::encode_to_vec(value, config::standard()).map_err(io::Error::other)?;
     let tmp = path.with_extension("tmp");

@@ -16,8 +16,6 @@ use crate::raft::Node;
 
 pub type NodeId = Uuid;
 
-/// How consensus reaches its peers. Kept behind a trait so the protocol can be
-/// tested against an in-memory cluster where messages can be dropped on demand.
 #[tonic::async_trait]
 pub trait RaftTransport: Send + Sync {
     async fn append_entries(
@@ -33,23 +31,16 @@ pub trait RaftTransport: Send + Sync {
     ) -> Result<RequestVoteResponse, String>;
 }
 
-// ------------------------------------------------------------------ over gRPC
-
 pub struct GrpcTransport {
     peers: HashMap<NodeId, RaftClient<Channel>>,
 }
 
 impl GrpcTransport {
-    /// Builds a client per peer without touching the network. `connect_lazy`
-    /// matters here: peers are routinely down at startup, and dialing eagerly
-    /// would stop this node from booting at all.
     pub fn new(peers: &HashMap<NodeId, String>) -> Result<Self, tonic::transport::Error> {
         let mut clients = HashMap::new();
         for (id, addr) in peers {
             let endpoint = Endpoint::from_shared(addr.clone())?
                 .connect_timeout(Duration::from_millis(100))
-                // Below the election timeout, so a wedged peer cannot outlast
-                // an election cycle and cause leadership churn.
                 .timeout(Duration::from_millis(120));
             clients.insert(*id, RaftClient::new(endpoint.connect_lazy()));
         }
@@ -67,8 +58,6 @@ impl RaftTransport for GrpcTransport {
         let Some(client) = self.peers.get(&to) else {
             return Err(format!("unknown peer {to}"));
         };
-        // Channel is an Arc internally, so cloning shares one connection pool
-        // and no lock is needed around the transport.
         let mut client = client.clone();
         client
             .append_entries(req)
@@ -94,8 +83,6 @@ impl RaftTransport for GrpcTransport {
     }
 }
 
-/// The peer-facing gRPC service. Separate from the client-facing `Queue`
-/// service so the two can be firewalled and scheduled independently.
 pub struct RaftService {
     node: Arc<Node>,
 }
@@ -123,10 +110,6 @@ impl Raft for RaftService {
     }
 }
 
-// ----------------------------------------------------------------- in memory
-
-/// A cluster wired by direct calls instead of sockets, so tests can drop
-/// messages, isolate nodes, and heal partitions deterministically.
 #[derive(Clone, Default)]
 pub struct MemoryCluster {
     inner: Arc<Mutex<MemoryClusterInner>>,
@@ -143,9 +126,6 @@ impl MemoryCluster {
         Self::default()
     }
 
-    /// Transports are handed out before the nodes exist, since a node needs its
-    /// transport at construction. They resolve through this registry instead of
-    /// holding node references directly.
     pub fn transport(&self, from: NodeId) -> Arc<dyn RaftTransport> {
         Arc::new(MemoryTransport { from, cluster: self.clone() })
     }
@@ -154,7 +134,6 @@ impl MemoryCluster {
         self.inner.lock().await.nodes.insert(node.id(), node);
     }
 
-    /// Cuts a node off in both directions.
     pub async fn isolate(&self, id: NodeId) {
         self.inner.lock().await.isolated.insert(id);
     }

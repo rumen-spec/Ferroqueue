@@ -46,8 +46,6 @@ message ListDlqResponse {
     repeated DeadJob jobs = 1;
 }
 
-// Returns the listed jobs to the ready queue with their retry count reset.
-// An empty job_ids redrives the entire dead-letter queue.
 message RedriveDlqRequest {
     repeated string job_ids = 1;
 }

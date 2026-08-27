@@ -1,6 +1,3 @@
-//! Cluster behaviour, exercised over the in-memory transport so partitions and
-//! failures are deterministic rather than a matter of timing luck.
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,8 +7,6 @@ use crate::raft::{Node, ProposeError, Role};
 use crate::state::{QueueState, Record};
 use crate::transport::{MemoryCluster, NodeId};
 
-/// Generous relative to a 150-300ms election timeout, so a slow machine does
-/// not turn a correctness test into a flaky one.
 const SETTLE: Duration = Duration::from_secs(5);
 
 fn id_for(name: &str, i: usize) -> NodeId {
@@ -49,7 +44,6 @@ async fn cluster(name: &str, size: usize) -> (MemoryCluster, Vec<Arc<Node>>) {
     (cluster, nodes)
 }
 
-/// Waits until exactly one of `candidates` reports itself leader.
 async fn wait_for_leader(candidates: &[Arc<Node>]) -> Arc<Node> {
     let deadline = Instant::now() + SETTLE;
     while Instant::now() < deadline {
@@ -108,7 +102,6 @@ async fn elects_exactly_one_leader() {
         if node.role().await == Role::Leader && node.term().await == term {
             leaders_in_term += 1;
         }
-        // Everyone should have converged on the same term.
         assert_eq!(node.term().await, term, "term disagreement across the cluster");
     }
     assert_eq!(leaders_in_term, 1, "two leaders in one term is a split brain");
@@ -156,7 +149,6 @@ async fn a_new_leader_takes_over_when_the_old_one_is_isolated() {
         "a new leader must run in a later term than the one it replaced"
     );
 
-    // The new majority can still make progress.
     new_leader.propose(enqueued(99)).await.expect("the remaining majority should commit");
 }
 
@@ -167,8 +159,6 @@ async fn an_isolated_leader_cannot_commit() {
 
     cluster.isolate(leader.id()).await;
 
-    // Cut off from its followers it has no majority, so this must fail rather
-    // than commit or hang.
     let result = tokio::time::timeout(SETTLE, leader.propose(enqueued(7))).await;
     match result {
         Ok(Err(ProposeError::LostLeadership)) | Ok(Err(ProposeError::NotLeader(_))) => {}
@@ -215,8 +205,6 @@ async fn a_lone_node_cannot_elect_itself_in_a_three_node_cluster() {
     let (cluster, nodes) = cluster("minority", 3).await;
     wait_for_leader(&nodes).await;
 
-    // Pick a node that is not the leader and cut it off. On its own it is a
-    // minority of one and must never win an election, however long it tries.
     let leader_id = wait_for_leader(&nodes).await.id();
     let lone = nodes.iter().find(|n| n.id() != leader_id).cloned().unwrap();
     cluster.isolate(lone.id()).await;
