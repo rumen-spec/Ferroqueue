@@ -1,48 +1,54 @@
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
-use std::thread;
+use std::path::{Path, PathBuf};
 
 use bincode_next::config;
 use bincode_next::{Decode, Encode};
-use chrono::DateTime;
-use tokio::sync::{mpsc, oneshot};
-use uuid::Uuid;
 
-use crate::broker::{QueueService, VISIBILITY_S, backoff_seconds};
-use crate::job::{Job, JobState, New};
+use crate::state::Record;
+
+/// Record framing: `u32` payload length, `u32` CRC32 of the payload.
 const HEADER_LEN: usize = 8;
-const MAX_BATCH: usize = 1024;
 
-#[derive(Encode, Decode, Debug, Clone)]
-pub enum Record {
-    Enqueued { job_id: u128, payload: String, created_at: i64 },
-    Acked { job_id: u128 },
-    Retried { job_id: u128, retries: i32 },
-    DeadLettered { job_id: u128 },
-    /// An operator returned a dead-lettered job to the ready queue.
-    Redriven { job_id: u128 },
+/// What a committed log entry instructs the cluster to do.
+///
+/// `Noop` exists because a freshly elected leader appends one to discover its
+/// own commit point without waiting for client traffic.
+#[derive(Encode, Decode, Debug, Clone, PartialEq)]
+pub enum EntryPayload {
+    Noop,
+    Queue(Record),
 }
 
-enum Cmd {
-    Write(Record, oneshot::Sender<()>),
-    Shutdown(oneshot::Sender<()>),
+/// One slot in the replicated log. `term` and `index` belong to Raft; the
+/// payload belongs to the application.
+#[derive(Encode, Decode, Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub term: u64,
+    pub index: u64,
+    pub payload: EntryPayload,
 }
 
-pub struct Wal {
-    tx: mpsc::Sender<Cmd>,
+/// The durable replicated log.
+///
+/// Entries are held in memory for the protocol to compare and stream, and
+/// mirrored to an append-only file. Index is 1-based; index 0 means "empty",
+/// which is what `prev_log_index` carries for the very first entry.
+pub struct RaftLog {
+    file: File,
+    entries: Vec<LogEntry>,
+    /// Byte offset where each entry's frame begins, so a truncation can shrink
+    /// the file without rewriting it.
+    offsets: Vec<u64>,
+    bytes: u64,
 }
 
-impl fmt::Debug for Wal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Wal")
-    }
-}
-
-impl Wal {
-    pub fn open(path: impl Into<PathBuf>) -> io::Result<(Self, Vec<Record>)> {
-        let path = path.into();
+impl RaftLog {
+    /// Opens the log at `path`, creating it if absent, and loads what is there.
+    /// A torn trailing record — the ordinary result of crashing mid-append — is
+    /// discarded and truncated away.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path: PathBuf = path.as_ref().to_path_buf();
 
         let mut data = Vec::new();
         match File::open(&path) {
@@ -53,108 +59,120 @@ impl Wal {
             Err(e) => return Err(e),
         }
 
-        let (records, valid_len) = parse(&data);
+        let (entries, offsets, valid_len) = parse(&data);
         if valid_len < data.len() {
             eprintln!(
-                "wal: discarding {} trailing byte(s) from an incomplete append",
+                "raft log: discarding {} trailing byte(s) from an incomplete append",
                 data.len() - valid_len
             );
-            OpenOptions::new()
-                .write(true)
-                .open(&path)?
-                .set_len(valid_len as u64)?;
+            OpenOptions::new().write(true).open(&path)?.set_len(valid_len as u64)?;
         }
 
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let (tx, rx) = mpsc::channel(MAX_BATCH);
-        thread::spawn(move || writer_loop(rx, file));
-
-        Ok((Wal { tx }, records))
+        Ok(RaftLog { file, entries, offsets, bytes: valid_len as u64 })
     }
 
-    pub async fn append(&self, record: Record) -> io::Result<()> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.tx
-            .send(Cmd::Write(record, ack_tx))
-            .await
-            .map_err(|_| writer_stopped())?;
-        ack_rx.await.map_err(|_| writer_stopped())
+    pub fn last_index(&self) -> u64 {
+        self.entries.last().map(|e| e.index).unwrap_or(0)
     }
 
-    pub async fn shutdown(&self) {
-        let (done_tx, done_rx) = oneshot::channel();
-        if self.tx.send(Cmd::Shutdown(done_tx)).await.is_ok() {
-            let _ = done_rx.await;
+    pub fn last_term(&self) -> u64 {
+        self.entries.last().map(|e| e.term).unwrap_or(0)
+    }
+
+    /// Term of the entry at `index`, or 0 for index 0 (the empty-log sentinel).
+    /// `None` means the index is past the end and there is nothing to compare.
+    pub fn term_at(&self, index: u64) -> Option<u64> {
+        if index == 0 {
+            return Some(0);
         }
+        self.entries.get((index - 1) as usize).map(|e| e.term)
+    }
+
+    pub fn entry(&self, index: u64) -> Option<&LogEntry> {
+        if index == 0 {
+            return None;
+        }
+        self.entries.get((index - 1) as usize)
+    }
+
+    /// Entries from `index` onward, capped at `limit`, for streaming to a
+    /// follower that is behind.
+    pub fn entries_from(&self, index: u64, limit: usize) -> Vec<LogEntry> {
+        if index == 0 || index > self.last_index() {
+            return Vec::new();
+        }
+        let start = (index - 1) as usize;
+        let end = (start + limit).min(self.entries.len());
+        self.entries[start..end].to_vec()
+    }
+
+    pub fn append(&mut self, new: &[LogEntry]) -> io::Result<()> {
+        if new.is_empty() {
+            return Ok(());
+        }
+
+        let mut buf = Vec::new();
+        let mut offsets = Vec::with_capacity(new.len());
+        let mut at = self.bytes;
+        for entry in new {
+            offsets.push(at);
+            let before = buf.len();
+            frame(entry, &mut buf).map_err(io::Error::other)?;
+            at += (buf.len() - before) as u64;
+        }
+
+        // One write and one fsync for the whole slice, so an AppendEntries
+        // carrying many entries costs a single flush.
+        self.file.write_all(&buf)?;
+        self.file.sync_data()?;
+
+        self.bytes = at;
+        self.entries.extend_from_slice(new);
+        self.offsets.extend_from_slice(&offsets);
+        Ok(())
+    }
+
+    /// Discards everything after `index`. Used when a follower's log diverges
+    /// from the leader's and the conflicting suffix has to go.
+    pub fn truncate_after(&mut self, index: u64) -> io::Result<()> {
+        if index >= self.last_index() {
+            return Ok(());
+        }
+        let keep = index as usize;
+        let new_bytes = self.offsets[keep];
+
+        self.file.set_len(new_bytes)?;
+        self.file.sync_data()?;
+
+        self.entries.truncate(keep);
+        self.offsets.truncate(keep);
+        self.bytes = new_bytes;
+        Ok(())
     }
 }
 
-fn writer_stopped() -> io::Error {
-    io::Error::other("wal writer stopped")
-}
-
-fn writer_loop(mut rx: mpsc::Receiver<Cmd>, mut file: File) {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut waiters: Vec<oneshot::Sender<()>> = Vec::new();
-
-    while let Some(mut cmd) = rx.blocking_recv() {
-        buf.clear();
-        waiters.clear();
-        let mut stopping = false;
-
-        loop {
-            match cmd {
-                Cmd::Write(record, ack) => match frame(&record, &mut buf) {
-                    Ok(()) => waiters.push(ack),
-                    Err(e) => eprintln!("wal: dropping unencodable record: {e}"),
-                },
-                Cmd::Shutdown(done) => {
-                    waiters.push(done);
-                    stopping = true;
-                }
-            }
-
-            if stopping || waiters.len() >= MAX_BATCH {
-                break;
-            }
-            match rx.try_recv() {
-                Ok(next) => cmd = next,
-                Err(_) => break,
-            }
-        }
-
-        if !buf.is_empty() {
-            if let Err(e) = file.write_all(&buf).and_then(|_| file.sync_data()) {
-                // Waiters are dropped unsignalled, so `append` reports the
-                // failure and the caller declines to apply the transition.
-                eprintln!("wal: append failed, {} record(s) rejected: {e}", waiters.len());
-                waiters.clear();
-                if stopping {
-                    break;
-                }
-                continue;
-            }
-        }
-
-        for waiter in waiters.drain(..) {
-            let _ = waiter.send(());
-        }
-        if stopping {
-            break;
-        }
-    }
-}
-
-fn frame(record: &Record, out: &mut Vec<u8>) -> Result<(), bincode_next::error::EncodeError> {
-    let payload = bincode_next::encode_to_vec(record, config::standard())?;
+fn frame(entry: &LogEntry, out: &mut Vec<u8>) -> Result<(), bincode_next::error::EncodeError> {
+    let payload = bincode_next::encode_to_vec(entry, config::standard())?;
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
     out.extend_from_slice(&payload);
     Ok(())
 }
 
-fn parse(data: &[u8]) -> (Vec<Record>, usize) {
-    let mut records = Vec::new();
+pub fn encode_entry(entry: &LogEntry) -> Result<Vec<u8>, bincode_next::error::EncodeError> {
+    bincode_next::encode_to_vec(entry, config::standard())
+}
+
+pub fn decode_entry(bytes: &[u8]) -> Result<LogEntry, bincode_next::error::DecodeError> {
+    bincode_next::decode_from_slice::<LogEntry, _>(bytes, config::standard()).map(|(entry, _)| entry)
+}
+
+/// Decodes entries until one fails to parse, returning them with their byte
+/// offsets and the offset of the first bad byte.
+fn parse(data: &[u8]) -> (Vec<LogEntry>, Vec<u64>, usize) {
+    let mut entries = Vec::new();
+    let mut offsets = Vec::new();
     let mut offset = 0;
 
     while offset + HEADER_LEN <= data.len() {
@@ -170,137 +188,103 @@ fn parse(data: &[u8]) -> (Vec<Record>, usize) {
         if crc32fast::hash(payload) != crc {
             break;
         }
-        let Ok((record, _)) =
-            bincode_next::decode_from_slice::<Record, _>(payload, config::standard())
-        else {
-            break;
-        };
+        let Ok(entry) = decode_entry(payload) else { break };
 
-        records.push(record);
+        entries.push(entry);
+        offsets.push(offset as u64);
         offset = end;
     }
 
-    (records, offset)
-}
-
-pub async fn replay(service: &QueueService, records: Vec<Record>) {
-    for record in records {
-        match record {
-            Record::Enqueued { job_id, payload, created_at } => {
-                let id = Uuid::from_u128(job_id);
-                let mut job = Job::new(payload);
-                job.set_id(id);
-                if let Some(created_at) = DateTime::from_timestamp_micros(created_at) {
-                    job.set_created_at(created_at);
-                }
-                service.jobs.lock().await.insert(id, job);
-                service.ready_queue.lock().await.push_back(id);
-            }
-            Record::Retried { job_id, retries } => {
-                let id = Uuid::from_u128(job_id);
-                if let Some(job) = service.jobs.lock().await.get_mut(&id) {
-                    job.set_retries(retries);
-                    // Backoff is a pure function of the retry count, so it does
-                    // not need its own field in the log.
-                    job.set_retry_time_s(backoff_seconds(retries));
-                }
-            }
-            Record::Acked { job_id } => {
-                let id = Uuid::from_u128(job_id);
-                service.jobs.lock().await.remove(&id);
-                service.ready_queue.lock().await.retain(|queued| *queued != id);
-            }
-            Record::DeadLettered { job_id } => {
-                let id = Uuid::from_u128(job_id);
-                service.ready_queue.lock().await.retain(|queued| *queued != id);
-                if let Some(job) = service.jobs.lock().await.get_mut(&id) {
-                    job.set_state(JobState::DLQ);
-                }
-                service.dl_queue.lock().await.push_back(id);
-            }
-            Record::Redriven { job_id } => {
-                let id = Uuid::from_u128(job_id);
-                service.dl_queue.lock().await.retain(|queued| *queued != id);
-                if let Some(job) = service.jobs.lock().await.get_mut(&id) {
-                    job.set_retries(0);
-                    job.set_retry_time_s(VISIBILITY_S);
-                    job.set_state(JobState::READY);
-                }
-                service.ready_queue.lock().await.push_back(id);
-            }
-        }
-    }
+    (entries, offsets, offset)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("ferroqueue-test-{name}.wal"));
+        let path = std::env::temp_dir().join(format!("ferroqueue-log-{name}.log"));
         let _ = std::fs::remove_file(&path);
         path
     }
 
-    fn enqueued(n: u128) -> Record {
-        Record::Enqueued { job_id: n, payload: format!("job-{n}"), created_at: n as i64 }
+    fn entry(term: u64, index: u64) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            payload: EntryPayload::Queue(Record::Enqueued {
+                job_id: index as u128,
+                payload: format!("job-{index}"),
+                created_at: index as i64,
+            }),
+        }
     }
 
-    #[tokio::test]
-    async fn opens_when_the_file_does_not_exist() {
+    #[test]
+    fn opens_when_the_file_does_not_exist() {
         let path = scratch("missing");
-        assert!(!Path::new(&path).exists());
+        assert!(!path.exists());
 
-        let (wal, records) = Wal::open(&path).expect("open should create the log");
-        assert!(records.is_empty());
-        wal.shutdown().await;
-
-        assert!(Path::new(&path).exists());
+        let log = RaftLog::open(&path).expect("open should create the log");
+        assert_eq!(log.last_index(), 0);
+        assert_eq!(log.term_at(0), Some(0), "index 0 is the empty-log sentinel");
+        assert!(path.exists());
     }
 
-    #[tokio::test]
-    async fn replays_what_it_appended() {
+    #[test]
+    fn reloads_what_it_appended() {
         let path = scratch("roundtrip");
 
-        let (wal, records) = Wal::open(&path).unwrap();
-        assert!(records.is_empty());
-        wal.append(enqueued(1)).await.unwrap();
-        wal.append(enqueued(2)).await.unwrap();
-        wal.append(Record::Acked { job_id: 1 }).await.unwrap();
-        wal.shutdown().await;
+        let mut log = RaftLog::open(&path).unwrap();
+        log.append(&[entry(1, 1), entry(1, 2), entry(2, 3)]).unwrap();
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.last_term(), 2);
 
-        let (wal, records) = Wal::open(&path).unwrap();
-        wal.shutdown().await;
-
-        assert_eq!(records.len(), 3);
-        assert!(matches!(records[0], Record::Enqueued { job_id: 1, .. }));
-        assert!(matches!(records[1], Record::Enqueued { job_id: 2, .. }));
-        assert!(matches!(records[2], Record::Acked { job_id: 1 }));
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.term_at(2), Some(1));
+        assert_eq!(log.term_at(3), Some(2));
+        assert_eq!(log.term_at(4), None, "past the end has no term to compare");
     }
 
-    #[tokio::test]
-    async fn discards_a_torn_trailing_record() {
+    #[test]
+    fn truncate_shrinks_memory_and_file_and_survives_reload() {
+        let path = scratch("truncate");
+
+        let mut log = RaftLog::open(&path).unwrap();
+        log.append(&[entry(1, 1), entry(1, 2), entry(1, 3), entry(1, 4)]).unwrap();
+        let full_len = std::fs::metadata(&path).unwrap().len();
+
+        log.truncate_after(2).unwrap();
+        assert_eq!(log.last_index(), 2);
+        assert!(std::fs::metadata(&path).unwrap().len() < full_len);
+
+        // Appending after a truncation must land at index 3 again.
+        log.append(&[entry(5, 3)]).unwrap();
+        assert_eq!(log.term_at(3), Some(5));
+
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.term_at(3), Some(5), "the overwritten entry is what reloads");
+    }
+
+    #[test]
+    fn discards_a_torn_trailing_record() {
         let path = scratch("torn");
 
-        let (wal, _) = Wal::open(&path).unwrap();
-        wal.append(enqueued(1)).await.unwrap();
-        wal.shutdown().await;
-
+        let mut log = RaftLog::open(&path).unwrap();
+        log.append(&[entry(1, 1)]).unwrap();
         let intact_len = std::fs::metadata(&path).unwrap().len();
 
-        // Simulate crashing partway through the next append.
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         let mut partial = Vec::new();
-        frame(&enqueued(2), &mut partial).unwrap();
+        frame(&entry(1, 2), &mut partial).unwrap();
         partial.truncate(partial.len() - 3);
         file.write_all(&partial).unwrap();
         file.sync_data().unwrap();
 
-        let (wal, records) = Wal::open(&path).unwrap();
-        wal.shutdown().await;
-
-        assert_eq!(records.len(), 1, "the torn record must not be replayed");
+        let log = RaftLog::open(&path).unwrap();
+        assert_eq!(log.last_index(), 1, "the torn entry must not load");
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             intact_len,
